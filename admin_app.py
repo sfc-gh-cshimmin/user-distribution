@@ -24,6 +24,35 @@ st.set_page_config(
 # =============================================================================
 
 st.session_state.setdefault("conn", None)
+st.session_state.setdefault("authenticated", False)
+
+# =============================================================================
+# Password gate
+# =============================================================================
+
+
+def check_admin_password():
+    """Require admin password before showing app content."""
+    if st.session_state["authenticated"]:
+        return True
+
+    try:
+        admin_password = st.secrets["admin"]["password"]
+    except Exception:
+        admin_password = "admin"  # fallback for local dev
+
+    entered = st.text_input("Admin Password", type="password", placeholder="Enter admin password")
+    if st.button("Login", type="primary"):
+        if entered == admin_password:
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+    return False
+
+
+if not check_admin_password():
+    st.stop()
 
 
 def get_conn():
