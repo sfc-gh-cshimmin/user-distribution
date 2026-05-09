@@ -228,7 +228,7 @@ def render_admin():
         return
 
     # Admin content
-    tab_create, tab_manage = st.tabs(["Create Event", "Manage Usernames"])
+    tab_create, tab_manage, tab_events = st.tabs(["Create Event", "Manage Usernames", "Event Management"])
 
     with tab_create:
         st.header("Create New Event")
@@ -345,98 +345,189 @@ def render_admin():
                 if df.empty:
                     st.info("No usernames match the current filters.")
                 else:
-                    st.dataframe(df, use_container_width=True, hide_index=True)
+                    # Select all / Select none buttons
+                    sel_col1, sel_col2, sel_col3 = st.columns([1, 1, 4])
+                    with sel_col1:
+                        if st.button("Select All", key="select_all"):
+                            st.session_state["select_all_flag"] = True
+                            st.rerun()
+                    with sel_col2:
+                        if st.button("Select None", key="select_none"):
+                            st.session_state["select_all_flag"] = False
+                            st.rerun()
 
+                    # Add selection column
+                    df_display = df.copy()
+                    default_select = st.session_state.get("select_all_flag", False)
+                    df_display.insert(0, "Select", default_select)
+
+                    edited_df = st.data_editor(
+                        df_display,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Select": st.column_config.CheckboxColumn("Select", default=False),
+                            "ACCOUNT_URL": None,
+                        },
+                        disabled=["USERNAME", "ACCOUNT_ID", "ACCOUNT_URL", "CLAIMER_EMAIL", "CLAIMED_AT"],
+                        key="username_editor",
+                    )
+
+                    selected_rows = edited_df[edited_df["Select"] == True]
+                    selected_count = len(selected_rows)
+
+                    st.caption(f"{selected_count} selected")
+
+                    # Actions
                     st.subheader("Actions")
-                    action_col1, action_col2 = st.columns(2)
 
-                    with action_col1:
-                        st.markdown("**Assign Username**")
-                        available_df = df[df["CLAIMER_EMAIL"].isna()]
-                        if available_df.empty:
-                            st.caption("No available usernames to assign.")
-                        else:
-                            assign_options = [f"{row['USERNAME']} @ {row['ACCOUNT_ID']}" for _, row in available_df.iterrows()]
-                            assign_selection = st.selectbox("Select username to assign", assign_options, key="assign_select")
-                            assign_email = st.text_input("Email to assign", key="assign_email")
-                            if st.button("Assign", type="primary", key="assign_btn"):
-                                if not assign_email.strip():
-                                    st.error("Email is required.")
+                    # Assign action
+                    assign_email = st.text_input("Email to assign", key="assign_email")
+                    btn_col1, btn_col2 = st.columns(2)
+
+                    with btn_col1:
+                        if st.button(f"Assign Selected ({selected_count})", type="primary", disabled=selected_count != 1):
+                            if not assign_email.strip():
+                                st.error("Email is required.")
+                            else:
+                                # Check if any selected rows are already claimed
+                                already_claimed = selected_rows[selected_rows["CLAIMER_EMAIL"].notna()]
+                                if len(already_claimed) > 0 and not st.session_state.get("confirm_reassign"):
+                                    st.session_state["confirm_reassign"] = True
+                                    st.rerun()
                                 else:
-                                    idx = assign_options.index(assign_selection)
-                                    row = available_df.iloc[idx]
+                                    assigned = 0
                                     try:
                                         cur = get_conn().cursor()
-                                        cur.execute(
-                                            f"""UPDATE {DATABASE}.{selected_event}.USERNAMES
-                                                SET CLAIMER_EMAIL = %s, CLAIMED_AT = CURRENT_TIMESTAMP()
-                                                WHERE USERNAME = %s AND ACCOUNT_ID = %s AND CLAIMER_EMAIL IS NULL""",
-                                            (assign_email.strip(), row["USERNAME"], row["ACCOUNT_ID"]),
-                                        )
-                                        if cur.rowcount > 0:
-                                            st.success(f"Assigned {row['USERNAME']} to {assign_email.strip()}")
-                                            st.rerun()
-                                        else:
-                                            st.warning("Username was already claimed.")
+                                        for _, row in selected_rows.iterrows():
+                                            cur.execute(
+                                                f"""UPDATE {DATABASE}.{selected_event}.USERNAMES
+                                                    SET CLAIMER_EMAIL = %s, CLAIMED_AT = CURRENT_TIMESTAMP()
+                                                    WHERE USERNAME = %s AND ACCOUNT_ID = %s""",
+                                                (assign_email.strip(), row["USERNAME"], row["ACCOUNT_ID"]),
+                                            )
+                                            assigned += cur.rowcount
+                                        st.success(f"Assigned {assigned} username(s) to {assign_email.strip()}")
+                                        st.session_state["confirm_reassign"] = False
+                                        st.rerun()
                                     except Exception as e:
                                         st.error(f"Error: {e}")
 
-                    with action_col2:
-                        st.markdown("**Unassign Username**")
-                        claimed_df = df[df["CLAIMER_EMAIL"].notna()]
-                        if claimed_df.empty:
-                            st.caption("No claimed usernames to unassign.")
-                        else:
-                            unassign_options = [
-                                f"{row['USERNAME']} @ {row['ACCOUNT_ID']} ({row['CLAIMER_EMAIL']})"
-                                for _, row in claimed_df.iterrows()
-                            ]
-                            unassign_selection = st.selectbox("Select username to unassign", unassign_options, key="unassign_select")
-                            if st.button("Unassign", type="secondary", key="unassign_btn"):
-                                idx = unassign_options.index(unassign_selection)
-                                row = claimed_df.iloc[idx]
+                    if st.session_state.get("confirm_reassign"):
+                        already_claimed = selected_rows[selected_rows["CLAIMER_EMAIL"].notna()]
+                        names = ", ".join(f"{r['USERNAME']}@{r['ACCOUNT_ID']} (currently: {r['CLAIMER_EMAIL']})" for _, r in already_claimed.iterrows())
+                        st.warning(f"The following are already assigned and will be re-assigned: **{names}**")
+                        rc1, rc2 = st.columns(2)
+                        with rc1:
+                            if st.button("Confirm Re-assign", type="primary", key="confirm_reassign_btn"):
+                                assigned = 0
                                 try:
                                     cur = get_conn().cursor()
-                                    cur.execute(
-                                        f"""UPDATE {DATABASE}.{selected_event}.USERNAMES
-                                            SET CLAIMER_EMAIL = NULL, CLAIMED_AT = NULL
-                                            WHERE USERNAME = %s AND ACCOUNT_ID = %s""",
-                                        (row["USERNAME"], row["ACCOUNT_ID"]),
-                                    )
-                                    st.success(f"Unassigned {row['USERNAME']}")
+                                    for _, row in selected_rows.iterrows():
+                                        cur.execute(
+                                            f"""UPDATE {DATABASE}.{selected_event}.USERNAMES
+                                                SET CLAIMER_EMAIL = %s, CLAIMED_AT = CURRENT_TIMESTAMP()
+                                                WHERE USERNAME = %s AND ACCOUNT_ID = %s""",
+                                            (assign_email.strip(), row["USERNAME"], row["ACCOUNT_ID"]),
+                                        )
+                                        assigned += cur.rowcount
+                                    st.success(f"Re-assigned {assigned} username(s) to {assign_email.strip()}")
+                                    st.session_state["confirm_reassign"] = False
                                     st.rerun()
                                 except Exception as e:
                                     st.error(f"Error: {e}")
+                        with rc2:
+                            if st.button("Cancel", key="cancel_reassign_btn"):
+                                st.session_state["confirm_reassign"] = False
+                                st.rerun()
 
-                    # Bulk unassign
-                    st.divider()
-                    if st.button("Unassign All (filtered)", type="secondary"):
-                        st.session_state["confirm_bulk_unassign"] = True
-
-                    if st.session_state.get("confirm_bulk_unassign"):
-                        claimed_df = df[df["CLAIMER_EMAIL"].notna()]
-                        st.warning(f"This will unassign **{len(claimed_df)}** usernames. Are you sure?")
-                        confirm_col1, confirm_col2 = st.columns(2)
-                        with confirm_col1:
-                            if st.button("Yes, unassign all", type="primary", key="confirm_yes"):
-                                try:
-                                    cur = get_conn().cursor()
-                                    for _, row in claimed_df.iterrows():
+                    with btn_col2:
+                        if st.button(f"Unassign Selected ({selected_count})", type="secondary", disabled=selected_count == 0):
+                            unassigned = 0
+                            try:
+                                cur = get_conn().cursor()
+                                for _, row in selected_rows.iterrows():
+                                    if pd.notna(row["CLAIMER_EMAIL"]):
                                         cur.execute(
                                             f"""UPDATE {DATABASE}.{selected_event}.USERNAMES
                                                 SET CLAIMER_EMAIL = NULL, CLAIMED_AT = NULL
                                                 WHERE USERNAME = %s AND ACCOUNT_ID = %s""",
                                             (row["USERNAME"], row["ACCOUNT_ID"]),
                                         )
-                                    st.success(f"Unassigned {len(claimed_df)} usernames.")
-                                    st.session_state["confirm_bulk_unassign"] = False
-                                    st.rerun()
-                                except Exception as e:
-                                    st.error(f"Error: {e}")
-                        with confirm_col2:
-                            if st.button("Cancel", key="confirm_no"):
-                                st.session_state["confirm_bulk_unassign"] = False
+                                        unassigned += cur.rowcount
+                                st.success(f"Unassigned {unassigned} username(s).")
                                 st.rerun()
+                            except Exception as e:
+                                st.error(f"Error: {e}")
+
+    with tab_events:
+        st.header("Event Management")
+
+        schemas = get_event_schemas()
+        if not schemas:
+            st.info("No events to manage.")
+        else:
+            evt = st.selectbox("Select Event", schemas, key="evt_mgmt_select")
+
+            if evt:
+                st.subheader("Rename Event")
+                new_name = st.text_input("New event name", value=evt, key="rename_input")
+                update_slug = st.checkbox("Also update the URL slug (schema name)", value=True,
+                                         help="Uncheck if QR codes have already been generated for the current URL")
+
+                if st.button("Rename", key="rename_btn"):
+                    new_sanitized = sanitize_schema_name(new_name)
+                    if update_slug:
+                        if new_sanitized == evt:
+                            st.info("Name unchanged.")
+                        else:
+                            try:
+                                cur = get_conn().cursor()
+                                cur.execute(f"ALTER SCHEMA {DATABASE}.{evt} RENAME TO {DATABASE}.{new_sanitized}")
+                                cur.execute(
+                                    f"UPDATE {DATABASE}.{new_sanitized}.EVENT_CONFIG SET EVENT_NAME = %s",
+                                    (new_sanitized,),
+                                )
+                                cur.execute(
+                                    f"UPDATE {DATABASE}.{new_sanitized}.USERNAMES SET EVENT_NAME = %s",
+                                    (new_sanitized,),
+                                )
+                                st.success(f"Renamed **{evt}** → **{new_sanitized}** (URL slug updated)")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error: {e}")
+                    else:
+                        # Only update display name in EVENT_CONFIG, keep schema as-is
+                        try:
+                            cur = get_conn().cursor()
+                            cur.execute(
+                                f"UPDATE {DATABASE}.{evt}.EVENT_CONFIG SET EVENT_NAME = %s",
+                                (new_sanitized,),
+                            )
+                            st.success(f"Display name updated to **{new_sanitized}**. URL slug remains `?event={evt}`")
+                        except Exception as e:
+                            st.error(f"Error: {e}")
+
+                st.divider()
+                st.subheader("Delete Event")
+                st.warning(f"This will permanently delete all data for event **{evt}**.")
+
+                confirm_delete = st.text_input(
+                    f"Type `{evt}` to confirm deletion",
+                    key="delete_confirm_input",
+                )
+                if st.button("Delete Event", type="secondary", key="delete_btn"):
+                    if confirm_delete.strip().upper() == evt:
+                        try:
+                            cur = get_conn().cursor()
+                            cur.execute(f"DROP SCHEMA IF EXISTS {DATABASE}.{evt} CASCADE")
+                            st.success(f"Event **{evt}** deleted.")
+                            del st.session_state["delete_confirm_input"]
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Error: {e}")
+                    else:
+                        st.error("Confirmation text doesn't match. Type the event name exactly.")
 
 
 # =============================================================================
