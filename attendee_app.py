@@ -228,7 +228,6 @@ def render_admin():
         return
 
     # Admin content
-    st.set_page_config  # already set, just change layout dynamically isn't possible
     tab_create, tab_manage = st.tabs(["Create Event", "Manage Usernames"])
 
     with tab_create:
