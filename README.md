@@ -81,7 +81,6 @@ password = "your-admin-password"
 ```
 ├── attendee_app.py      # Main app (attendee + admin, routed by ?event= param)
 ├── config.py            # Snowflake connection helper with multi-auth support
-├── admin_app.py         # Standalone admin app (unused in production, kept for reference)
 ├── requirements.txt     # Python dependencies
 ├── Dockerfile           # SPCS/container deployment (nginx + streamlit)
 ├── nginx.conf           # Path rewriting (/EVENT → ?event=EVENT)
@@ -92,3 +91,20 @@ password = "your-admin-password"
     ├── 01_create_infrastructure.sql
     └── 02_create_service.sql
 ```
+
+## Concurrency / Race Condition Handling
+
+The app handles multiple attendees claiming at the same time without double-assigning:
+
+1. **Fetch candidates** — SELECT fetches 10 unclaimed rows (not 1) as a batch
+2. **Conditional UPDATE** — each claim attempt uses:
+   ```sql
+   UPDATE USERNAMES
+   SET CLAIMER_EMAIL = :email, CLAIMED_AT = CURRENT_TIMESTAMP()
+   WHERE USERNAME = :username AND ACCOUNT_ID = :account_id AND CLAIMER_EMAIL IS NULL
+   ```
+   The `AND CLAIMER_EMAIL IS NULL` clause acts as an optimistic lock. Snowflake's row-level locking ensures only one UPDATE can succeed per row.
+3. **Check rowcount** — if `cursor.rowcount == 0`, the row was grabbed by someone else; try the next candidate
+4. **Retry through batch** — iterates through up to 10 candidates before giving up
+
+This means even under heavy concurrency, each user works through their candidate list until one succeeds. The only failure case is if all 10 candidates are claimed between the SELECT and the UPDATE loop, which would require extreme load.

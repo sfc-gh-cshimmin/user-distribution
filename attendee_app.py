@@ -158,11 +158,34 @@ def get_claimed_usernames(schema: str):
 def claim_username(schema: str, email: str):
     conn = get_conn()
     cur = conn.cursor()
+
+    # Get distribution mode from event config
+    try:
+        cur.execute(f"SELECT DISTRIBUTION_MODE FROM {DATABASE}.{schema}.EVENT_CONFIG LIMIT 1")
+        row = cur.fetchone()
+        mode = row[0] if row and row[0] else "sequential"
+    except Exception:
+        mode = "sequential"
+
+    # Build ORDER BY based on distribution mode
+    if mode == "round_robin":
+        # Pick from the account with the most available usernames
+        order_clause = """
+            ORDER BY (SELECT COUNT(*) FROM {db}.{schema}.USERNAMES u2 
+                      WHERE u2.ACCOUNT_ID = {db}.{schema}.USERNAMES.ACCOUNT_ID 
+                      AND u2.CLAIMER_EMAIL IS NULL) DESC, USERNAME ASC
+        """.format(db=DATABASE, schema=schema)
+    elif mode == "random":
+        order_clause = "ORDER BY RANDOM()"
+    else:
+        # sequential (default): fill one account before moving to the next
+        order_clause = "ORDER BY ACCOUNT_ID ASC, USERNAME ASC"
+
     cur.execute(
         f"""SELECT USERNAME, ACCOUNT_ID, ACCOUNT_URL
             FROM {DATABASE}.{schema}.USERNAMES
             WHERE CLAIMER_EMAIL IS NULL
-            ORDER BY ACCOUNT_ID ASC, USERNAME ASC
+            {order_clause}
             LIMIT 10""",
     )
     candidates = cur.fetchall()
@@ -244,11 +267,46 @@ def render_admin():
             placeholder="Account ID, Status, Assigned To, URL\nSFSEHOL_ABC123, Active, John, https://app.snowflake.com/...",
             help="Same format as si_admin: Account ID, Status, Assigned To, URL",
         )
+        if accounts_csv.strip():
+            parsed_accounts_preview = parse_account_csv(accounts_csv)
+            st.caption(f"{len(parsed_accounts_preview)} account(s) detected")
+
         usernames_input = st.text_area(
-            "Usernames (comma-separated)",
-            placeholder="USER1, USER2, USER3, ..., USER50",
+            "Usernames (comma or newline separated)",
+            height=200,
+            placeholder="USER1, USER2, USER3, ..., USER50\nor one per line:\nUSER1\nUSER2\nUSER3",
             help="These usernames will be created for EACH account",
         )
+        if usernames_input.strip():
+            parsed_usernames_preview = [u.strip().upper() for u in re.split(r'[,\n]+', usernames_input) if u.strip()]
+            st.caption(f"{len(parsed_usernames_preview)} username(s) detected")
+
+        distribution_mode = st.radio(
+            "Distribution Mode",
+            ["sequential", "round_robin", "random"],
+            horizontal=True,
+            help="How usernames are assigned when attendees claim",
+            captions=[
+                "Fill one account completely before moving to the next",
+                "Spread claims evenly across accounts (picks from the account with the most available)",
+                "Assign a random available username from any account",
+            ],
+        )
+
+        # Overview panel
+        st.divider()
+        st.subheader("Event Summary")
+        preview_accounts = parse_account_csv(accounts_csv) if accounts_csv.strip() else []
+        preview_usernames = [u.strip().upper() for u in re.split(r'[,\n]+', usernames_input) if u.strip()] if usernames_input.strip() else []
+        preview_schema = sanitize_schema_name(event_name) if event_name.strip() else "—"
+        total_rows = len(preview_accounts) * len(preview_usernames)
+
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Accounts", len(preview_accounts))
+        col2.metric("Usernames", len(preview_usernames))
+        col3.metric("Total Rows", total_rows)
+        col4.metric("Distribution", distribution_mode)
+        st.markdown(f"**Event slug:** `{preview_schema}` &nbsp;&nbsp; **URL:** `?event={preview_schema}`")
 
         if st.button("Create Event", type="primary"):
             if not event_name.strip():
@@ -260,7 +318,7 @@ def render_admin():
             else:
                 schema = sanitize_schema_name(event_name)
                 accounts = parse_account_csv(accounts_csv)
-                usernames = [u.strip().upper() for u in usernames_input.split(",") if u.strip()]
+                usernames = [u.strip().upper() for u in re.split(r'[,\n]+', usernames_input) if u.strip()]
 
                 if not accounts:
                     st.error("No valid accounts parsed from CSV.")
@@ -284,14 +342,15 @@ def render_admin():
                         """)
                         cur.execute(f"""
                             CREATE TABLE IF NOT EXISTS {DATABASE}.{schema}.EVENT_CONFIG (
-                                EVENT_NAME  VARCHAR,
-                                PASSWORD    VARCHAR,
-                                CREATED_AT  TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+                                EVENT_NAME          VARCHAR,
+                                PASSWORD            VARCHAR,
+                                DISTRIBUTION_MODE   VARCHAR DEFAULT 'sequential',
+                                CREATED_AT          TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
                             )
                         """)
                         cur.execute(
-                            f"INSERT INTO {DATABASE}.{schema}.EVENT_CONFIG (EVENT_NAME, PASSWORD) VALUES (%s, %s)",
-                            (schema, DEFAULT_PASSWORD),
+                            f"INSERT INTO {DATABASE}.{schema}.EVENT_CONFIG (EVENT_NAME, PASSWORD, DISTRIBUTION_MODE) VALUES (%s, %s, %s)",
+                            (schema, DEFAULT_PASSWORD, distribution_mode),
                         )
                         rows_to_insert = []
                         for acct in accounts:
@@ -443,11 +502,19 @@ def render_admin():
 
                     with btn_col2:
                         if st.button(f"Unassign Selected ({selected_count})", type="secondary", disabled=selected_count == 0):
-                            unassigned = 0
-                            try:
-                                cur = get_conn().cursor()
-                                for _, row in selected_rows.iterrows():
-                                    if pd.notna(row["CLAIMER_EMAIL"]):
+                            st.session_state["confirm_unassign"] = True
+                            st.rerun()
+
+                    if st.session_state.get("confirm_unassign"):
+                        claimed_in_selection = selected_rows[selected_rows["CLAIMER_EMAIL"].notna()]
+                        st.warning(f"Unassign **{len(claimed_in_selection)}** username(s)?")
+                        uc1, uc2 = st.columns(2)
+                        with uc1:
+                            if st.button("Confirm Unassign", type="primary", key="confirm_unassign_btn"):
+                                unassigned = 0
+                                try:
+                                    cur = get_conn().cursor()
+                                    for _, row in claimed_in_selection.iterrows():
                                         cur.execute(
                                             f"""UPDATE {DATABASE}.{selected_event}.USERNAMES
                                                 SET CLAIMER_EMAIL = NULL, CLAIMED_AT = NULL
@@ -455,10 +522,15 @@ def render_admin():
                                             (row["USERNAME"], row["ACCOUNT_ID"]),
                                         )
                                         unassigned += cur.rowcount
-                                st.success(f"Unassigned {unassigned} username(s).")
+                                    st.success(f"Unassigned {unassigned} username(s).")
+                                    st.session_state["confirm_unassign"] = False
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Error: {e}")
+                        with uc2:
+                            if st.button("Cancel", key="cancel_unassign_btn"):
+                                st.session_state["confirm_unassign"] = False
                                 st.rerun()
-                            except Exception as e:
-                                st.error(f"Error: {e}")
 
     with tab_events:
         st.header("Event Management")
@@ -547,30 +619,41 @@ def render_attendee(selected_event: str):
             st.session_state["claimed"] = None
             st.rerun()
     else:
-        email = st.text_input(
-            "Email Address",
-            placeholder="you@company.com",
-            help="Enter the email you registered with",
+        # Check if any usernames are available
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT COUNT(*) FROM {DATABASE}.{selected_event}.USERNAMES WHERE CLAIMER_EMAIL IS NULL"
         )
-        if st.button("Claim Account", type="primary", use_container_width=True):
-            if not email or not email.strip():
-                st.error("Please enter your email address.")
-            elif "@" not in email or "." not in email.split("@")[-1]:
-                st.error("Please enter a valid email address.")
-            else:
-                email_clean = email.strip().lower()
-                with st.spinner("Finding your account..."):
-                    existing = check_existing_claim(selected_event, email_clean)
-                    if existing:
-                        st.session_state["claimed"] = existing
-                        st.rerun()
-                    else:
-                        result = claim_username(selected_event, email_clean)
-                        if result:
-                            st.session_state["claimed"] = result
+        available_count = cur.fetchone()[0]
+
+        if available_count == 0:
+            st.warning("All usernames for this event have been claimed. Please contact your instructor if you need assistance.")
+        else:
+            email = st.text_input(
+                "Email Address",
+                placeholder="you@company.com",
+                help="Enter the email you registered with",
+            )
+            if st.button("Claim Account", type="primary", use_container_width=True):
+                if not email or not email.strip():
+                    st.error("Please enter your email address.")
+                elif "@" not in email or "." not in email.split("@")[-1]:
+                    st.error("Please enter a valid email address.")
+                else:
+                    email_clean = email.strip().lower()
+                    with st.spinner("Finding your account..."):
+                        existing = check_existing_claim(selected_event, email_clean)
+                        if existing:
+                            st.session_state["claimed"] = existing
                             st.rerun()
                         else:
-                            st.error("All accounts are currently full. Please contact the event organizer.")
+                            result = claim_username(selected_event, email_clean)
+                            if result:
+                                st.session_state["claimed"] = result
+                                st.rerun()
+                            else:
+                                st.error("All accounts are currently full. Please contact the event organizer.")
 
     # Claimed accounts list
     st.divider()
