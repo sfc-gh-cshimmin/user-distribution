@@ -635,7 +635,7 @@ def render_attendee(selected_event: str):
                 placeholder="you@company.com",
                 help="Enter the email you registered with",
             )
-            if st.button("Claim Account", type="primary", use_container_width=True):
+            if st.button("Claim Username", type="primary", use_container_width=True):
                 if not email or not email.strip():
                     st.error("Please enter your email address.")
                 elif "@" not in email or "." not in email.split("@")[-1]:
