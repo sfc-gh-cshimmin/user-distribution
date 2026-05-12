@@ -8,7 +8,65 @@ import re
 import pandas as pd
 import streamlit as st
 from typing import List, Dict
-from config import get_connection, DATABASE, DEFAULT_PASSWORD
+from config import get_connection, get_account_connection, DATABASE, DEFAULT_PASSWORD
+
+
+# =============================================================================
+# Email helper (AWS SES)
+# =============================================================================
+
+
+def send_claim_email(claim: dict):
+    """Send credentials email via AWS SES. Shows toast on success/failure."""
+    try:
+        if "ses" not in st.secrets:
+            return
+
+        ses_config = st.secrets["ses"]
+
+        import boto3
+
+        client = boto3.client(
+            "ses",
+            region_name=ses_config.get("region", "us-west-2"),
+            aws_access_key_id=ses_config["aws_access_key_id"],
+            aws_secret_access_key=ses_config["aws_secret_access_key"],
+        )
+
+        sender = ses_config["sender"]
+        account_link = claim.get("account_url", claim["account_id"])
+
+        body_html = f"""
+        <h2>Your Lab Credentials</h2>
+        <table style="border-collapse:collapse; font-size:16px;">
+            <tr><td style="padding:8px; font-weight:bold;">Account</td><td style="padding:8px;"><a href="{account_link}">{account_link}</a></td></tr>
+            <tr><td style="padding:8px; font-weight:bold;">Username</td><td style="padding:8px;"><code>{claim['username']}</code></td></tr>
+            <tr><td style="padding:8px; font-weight:bold;">Password</td><td style="padding:8px;"><code>{DEFAULT_PASSWORD}</code></td></tr>
+        </table>
+        <p style="margin-top:16px; color:#666;">Save these credentials. You'll need them to log in to the lab environment.</p>
+        """
+
+        body_text = f"""Your Lab Credentials
+Account: {account_link}
+Username: {claim['username']}
+Password: {DEFAULT_PASSWORD}
+
+Save these credentials. You'll need them to log in to the lab environment."""
+
+        client.send_email(
+            Source=sender,
+            Destination={"ToAddresses": [claim["email"]]},
+            Message={
+                "Subject": {"Data": "Your Lab Account Credentials"},
+                "Body": {
+                    "Html": {"Data": body_html},
+                    "Text": {"Data": body_text},
+                },
+            },
+        )
+        st.toast(f"Email sent to {claim['email']}")
+    except Exception as e:
+        st.toast(f"Email failed: {e}", icon="⚠️")
 
 # =============================================================================
 # Page configuration
@@ -101,18 +159,21 @@ def get_accounts_for_event(schema: str) -> List[str]:
 
 
 def get_usernames_df(schema: str, accounts: List[str], availability: str) -> pd.DataFrame:
+    """Query usernames with filters applied."""
     conn = get_conn()
     cur = conn.cursor()
-    query = f"SELECT USERNAME, ACCOUNT_ID, ACCOUNT_URL, CLAIMER_EMAIL, CLAIMED_AT FROM {DATABASE}.{schema}.USERNAMES WHERE 1=1"
+    query = f"SELECT USERNAME, ACCOUNT_ID, ACCOUNT_URL, CLAIMER_EMAIL, CLAIMED_AT, PREVIOUSLY_ASSIGNED_TO FROM {DATABASE}.{schema}.USERNAMES WHERE USERNAME != '__ACCOUNT_REF__'"
     params = []
     if accounts:
         placeholders = ", ".join(["%s"] * len(accounts))
         query += f" AND ACCOUNT_ID IN ({placeholders})"
         params.extend(accounts)
     if availability == "Available":
-        query += " AND CLAIMER_EMAIL IS NULL"
+        query += " AND CLAIMER_EMAIL IS NULL AND PREVIOUSLY_ASSIGNED_TO IS NULL"
     elif availability == "Claimed":
         query += " AND CLAIMER_EMAIL IS NOT NULL"
+    elif availability == "Burned":
+        query += " AND PREVIOUSLY_ASSIGNED_TO IS NOT NULL AND CLAIMER_EMAIL IS NULL"
     query += " ORDER BY ACCOUNT_ID, USERNAME"
     cur.execute(query, params)
     cols = [desc[0] for desc in cur.description]
@@ -159,32 +220,42 @@ def claim_username(schema: str, email: str):
     conn = get_conn()
     cur = conn.cursor()
 
-    # Get distribution mode from event config
+    # Get event config
     try:
-        cur.execute(f"SELECT DISTRIBUTION_MODE FROM {DATABASE}.{schema}.EVENT_CONFIG LIMIT 1")
+        cur.execute(f"SELECT DISTRIBUTION_MODE, EVENT_MODE FROM {DATABASE}.{schema}.EVENT_CONFIG LIMIT 1")
         row = cur.fetchone()
         mode = row[0] if row and row[0] else "sequential"
+        event_mode = row[1] if row and row[1] else "static"
     except Exception:
         mode = "sequential"
+        event_mode = "static"
+
+    if event_mode == "dynamic":
+        return _claim_dynamic(schema, email, mode, conn)
+    else:
+        return _claim_static(schema, email, mode, conn)
+
+
+def _claim_static(schema: str, email: str, mode: str, conn):
+    """Claim from pre-populated usernames (existing behavior)."""
+    cur = conn.cursor()
 
     # Build ORDER BY based on distribution mode
     if mode == "round_robin":
-        # Pick from the account with the most available usernames
         order_clause = """
             ORDER BY (SELECT COUNT(*) FROM {db}.{schema}.USERNAMES u2 
                       WHERE u2.ACCOUNT_ID = {db}.{schema}.USERNAMES.ACCOUNT_ID 
-                      AND u2.CLAIMER_EMAIL IS NULL) DESC, USERNAME ASC
+                      AND u2.CLAIMER_EMAIL IS NULL AND u2.PREVIOUSLY_ASSIGNED_TO IS NULL) DESC, USERNAME ASC
         """.format(db=DATABASE, schema=schema)
     elif mode == "random":
         order_clause = "ORDER BY RANDOM()"
     else:
-        # sequential (default): fill one account before moving to the next
         order_clause = "ORDER BY ACCOUNT_ID ASC, USERNAME ASC"
 
     cur.execute(
         f"""SELECT USERNAME, ACCOUNT_ID, ACCOUNT_URL
             FROM {DATABASE}.{schema}.USERNAMES
-            WHERE CLAIMER_EMAIL IS NULL
+            WHERE CLAIMER_EMAIL IS NULL AND PREVIOUSLY_ASSIGNED_TO IS NULL
             {order_clause}
             LIMIT 10""",
     )
@@ -196,12 +267,122 @@ def claim_username(schema: str, email: str):
         cur.execute(
             f"""UPDATE {DATABASE}.{schema}.USERNAMES
                 SET CLAIMER_EMAIL = %s, CLAIMED_AT = CURRENT_TIMESTAMP()
-                WHERE USERNAME = %s AND ACCOUNT_ID = %s AND CLAIMER_EMAIL IS NULL""",
+                WHERE USERNAME = %s AND ACCOUNT_ID = %s AND CLAIMER_EMAIL IS NULL AND PREVIOUSLY_ASSIGNED_TO IS NULL""",
             (email, username, account_id),
         )
         if cur.rowcount > 0:
             return {"username": username, "account_id": account_id, "account_url": account_url, "email": email}
     return None
+
+
+def _claim_dynamic(schema: str, email: str, mode: str, conn):
+    """Generate a new USER on-the-fly and claim it."""
+    cur = conn.cursor()
+
+    # Pick which account to create the user on based on distribution mode
+    if mode == "round_robin":
+        # Account with the fewest claimed users
+        cur.execute(f"""
+            SELECT ACCOUNT_ID, ACCOUNT_URL FROM {DATABASE}.{schema}.USERNAMES
+            WHERE USERNAME = '__ACCOUNT_REF__'
+            ORDER BY (
+                SELECT COUNT(*) FROM {DATABASE}.{schema}.USERNAMES u2
+                WHERE u2.ACCOUNT_ID = {DATABASE}.{schema}.USERNAMES.ACCOUNT_ID
+                AND u2.USERNAME != '__ACCOUNT_REF__'
+            ) ASC
+            LIMIT 1
+        """)
+    elif mode == "random":
+        cur.execute(f"""
+            SELECT ACCOUNT_ID, ACCOUNT_URL FROM {DATABASE}.{schema}.USERNAMES
+            WHERE USERNAME = '__ACCOUNT_REF__'
+            ORDER BY RANDOM()
+            LIMIT 1
+        """)
+    else:
+        # Sequential: fill one account at a time
+        cur.execute(f"""
+            SELECT ACCOUNT_ID, ACCOUNT_URL FROM {DATABASE}.{schema}.USERNAMES
+            WHERE USERNAME = '__ACCOUNT_REF__'
+            ORDER BY ACCOUNT_ID ASC
+            LIMIT 1
+        """)
+
+    account_row = cur.fetchone()
+    if not account_row:
+        return None
+
+    account_id, account_url = account_row
+
+    # Determine next username number for this account
+    cur.execute(
+        f"""SELECT COUNT(*) FROM {DATABASE}.{schema}.USERNAMES
+            WHERE ACCOUNT_ID = %s AND USERNAME != '__ACCOUNT_REF__'""",
+        (account_id,),
+    )
+    user_count = cur.fetchone()[0]
+    new_username = f"USER{user_count + 1}"
+
+    # Create the USER on the target account
+    try:
+        acct_conn = get_account_connection(account_url)
+        acct_cur = acct_conn.cursor()
+        acct_cur.execute(f"""
+            CREATE USER IF NOT EXISTS {new_username}
+            PASSWORD = '{DEFAULT_PASSWORD}'
+            DEFAULT_ROLE = PUBLIC
+            MUST_CHANGE_PASSWORD = FALSE
+        """)
+        acct_cur.execute(f"GRANT ROLE PUBLIC TO USER {new_username}")
+        acct_cur.execute(f"ALTER USER {new_username} SET MINS_TO_BYPASS_MFA = 30")
+        acct_conn.close()
+    except Exception as e:
+        st.toast(f"Failed to create user on account: {e}", icon="⚠️")
+        return None
+
+    # Insert and claim the row in one go
+    cur.execute(
+        f"""INSERT INTO {DATABASE}.{schema}.USERNAMES
+            (USERNAME, ACCOUNT_ID, ACCOUNT_URL, CLAIMER_EMAIL, CLAIMED_AT, EVENT_NAME)
+            VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP(), %s)""",
+        (new_username, account_id, account_url, email, schema),
+    )
+
+    return {"username": new_username, "account_id": account_id, "account_url": account_url, "email": email}
+
+
+def unassign_username(schema: str, username: str, account_id: str, account_url: str, old_email: str):
+    """Unassign a username: mark burned, DROP USER on target account."""
+    conn = get_conn()
+    cur = conn.cursor()
+
+    # Mark as burned with previous email
+    cur.execute(
+        f"""UPDATE {DATABASE}.{schema}.USERNAMES
+            SET CLAIMER_EMAIL = NULL, CLAIMED_AT = NULL, PREVIOUSLY_ASSIGNED_TO = %s
+            WHERE USERNAME = %s AND ACCOUNT_ID = %s""",
+        (old_email, username, account_id),
+    )
+
+    # Get event mode to decide whether to DROP USER
+    try:
+        cur.execute(f"SELECT EVENT_MODE FROM {DATABASE}.{schema}.EVENT_CONFIG LIMIT 1")
+        row = cur.fetchone()
+        event_mode = row[0] if row and row[0] else "static"
+    except Exception:
+        event_mode = "static"
+
+    # DROP USER on the target account (dynamic mode only)
+    if event_mode == "dynamic" and account_url:
+        try:
+            acct_conn = get_account_connection(account_url)
+            acct_cur = acct_conn.cursor()
+            acct_cur.execute(f"DROP USER IF EXISTS {username}")
+            acct_conn.close()
+        except Exception:
+            pass  # Best effort — user might already be gone
+
+    return cur.rowcount > 0
 
 
 def render_confirmation(claim):
@@ -261,6 +442,7 @@ def render_admin():
             placeholder="e.g., SI_SUMMIT_2025",
             help="Will be used as the schema name",
         )
+
         accounts_csv = st.text_area(
             "Account List (CSV)",
             height=200,
@@ -271,15 +453,29 @@ def render_admin():
             parsed_accounts_preview = parse_account_csv(accounts_csv)
             st.caption(f"{len(parsed_accounts_preview)} account(s) detected")
 
-        usernames_input = st.text_area(
-            "Usernames (comma or newline separated)",
-            height=200,
-            placeholder="USER1, USER2, USER3, ..., USER50\nor one per line:\nUSER1\nUSER2\nUSER3",
-            help="These usernames will be created for EACH account",
+        username_source = st.radio(
+            "Username Source",
+            ["Provide List", "Generate Dynamically"],
+            horizontal=True,
+            captions=[
+                "Provide a list of existing usernames",
+                "Create USERs on-the-fly when attendees claim (USER1, USER2, ...)",
+            ],
         )
-        if usernames_input.strip():
-            parsed_usernames_preview = [u.strip().upper() for u in re.split(r'[,\n]+', usernames_input) if u.strip()]
-            st.caption(f"{len(parsed_usernames_preview)} username(s) detected")
+
+        if username_source == "Provide List":
+            usernames_input = st.text_area(
+                "Usernames (comma or newline separated)",
+                height=200,
+                placeholder="USER1, USER2, USER3, ..., USER50\nor one per line:\nUSER1\nUSER2\nUSER3",
+                help="These usernames will be created for EACH account",
+            )
+            if usernames_input.strip():
+                parsed_usernames_preview = [u.strip().upper() for u in re.split(r'[,\n]+', usernames_input) if u.strip()]
+                st.caption(f"{len(parsed_usernames_preview)} username(s) detected")
+        else:
+            usernames_input = ""
+            st.info("Usernames will be generated automatically (USER1, USER2, ...) when attendees claim.")
 
         distribution_mode = st.radio(
             "Distribution Mode",
@@ -299,30 +495,34 @@ def render_admin():
         preview_accounts = parse_account_csv(accounts_csv) if accounts_csv.strip() else []
         preview_usernames = [u.strip().upper() for u in re.split(r'[,\n]+', usernames_input) if u.strip()] if usernames_input.strip() else []
         preview_schema = sanitize_schema_name(event_name) if event_name.strip() else "—"
-        total_rows = len(preview_accounts) * len(preview_usernames)
+        event_mode = "static" if username_source == "Provide List" else "dynamic"
 
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Accounts", len(preview_accounts))
-        col2.metric("Usernames", len(preview_usernames))
-        col3.metric("Total Rows", total_rows)
+        if event_mode == "static":
+            col2.metric("Usernames", len(preview_usernames))
+            col3.metric("Total Rows", len(preview_accounts) * len(preview_usernames))
+        else:
+            col2.metric("Usernames", "Dynamic")
+            col3.metric("Total Rows", "On demand")
         col4.metric("Distribution", distribution_mode)
-        st.markdown(f"**Event slug:** `{preview_schema}` &nbsp;&nbsp; **URL:** `?event={preview_schema}`")
+        st.markdown(f"**Event slug:** `{preview_schema}` &nbsp;&nbsp; **URL:** `?event={preview_schema}` &nbsp;&nbsp; **Mode:** `{event_mode}`")
 
         if st.button("Create Event", type="primary"):
             if not event_name.strip():
                 st.error("Event name is required.")
             elif not accounts_csv.strip():
                 st.error("Account list is required.")
-            elif not usernames_input.strip():
-                st.error("Username list is required.")
+            elif event_mode == "static" and not usernames_input.strip():
+                st.error("Username list is required for static mode.")
             else:
                 schema = sanitize_schema_name(event_name)
                 accounts = parse_account_csv(accounts_csv)
-                usernames = [u.strip().upper() for u in re.split(r'[,\n]+', usernames_input) if u.strip()]
+                usernames = [u.strip().upper() for u in re.split(r'[,\n]+', usernames_input) if u.strip()] if usernames_input.strip() else []
 
                 if not accounts:
                     st.error("No valid accounts parsed from CSV.")
-                elif not usernames:
+                elif event_mode == "static" and not usernames:
                     st.error("No valid usernames parsed.")
                 else:
                     try:
@@ -332,12 +532,13 @@ def render_admin():
                         cur.execute(f"CREATE SCHEMA IF NOT EXISTS {DATABASE}.{schema}")
                         cur.execute(f"""
                             CREATE TABLE IF NOT EXISTS {DATABASE}.{schema}.USERNAMES (
-                                USERNAME        VARCHAR NOT NULL,
-                                ACCOUNT_ID      VARCHAR NOT NULL,
-                                ACCOUNT_URL     VARCHAR,
-                                CLAIMER_EMAIL   VARCHAR,
-                                CLAIMED_AT      TIMESTAMP_NTZ,
-                                EVENT_NAME      VARCHAR
+                                USERNAME                VARCHAR NOT NULL,
+                                ACCOUNT_ID              VARCHAR NOT NULL,
+                                ACCOUNT_URL             VARCHAR,
+                                CLAIMER_EMAIL           VARCHAR,
+                                CLAIMED_AT              TIMESTAMP_NTZ,
+                                PREVIOUSLY_ASSIGNED_TO  VARCHAR,
+                                EVENT_NAME              VARCHAR
                             )
                         """)
                         cur.execute(f"""
@@ -345,24 +546,38 @@ def render_admin():
                                 EVENT_NAME          VARCHAR,
                                 PASSWORD            VARCHAR,
                                 DISTRIBUTION_MODE   VARCHAR DEFAULT 'sequential',
+                                EVENT_MODE          VARCHAR DEFAULT 'static',
                                 CREATED_AT          TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
                             )
                         """)
                         cur.execute(
-                            f"INSERT INTO {DATABASE}.{schema}.EVENT_CONFIG (EVENT_NAME, PASSWORD, DISTRIBUTION_MODE) VALUES (%s, %s, %s)",
-                            (schema, DEFAULT_PASSWORD, distribution_mode),
+                            f"INSERT INTO {DATABASE}.{schema}.EVENT_CONFIG (EVENT_NAME, PASSWORD, DISTRIBUTION_MODE, EVENT_MODE) VALUES (%s, %s, %s, %s)",
+                            (schema, DEFAULT_PASSWORD, distribution_mode, event_mode),
                         )
-                        rows_to_insert = []
-                        for acct in accounts:
-                            for uname in usernames:
-                                rows_to_insert.append((uname, acct["account_id"], acct["url"], schema))
-                        cur.executemany(
-                            f"INSERT INTO {DATABASE}.{schema}.USERNAMES (USERNAME, ACCOUNT_ID, ACCOUNT_URL, EVENT_NAME) VALUES (%s, %s, %s, %s)",
-                            rows_to_insert,
-                        )
-                        st.success(
-                            f"Event **{schema}** created with {len(accounts)} accounts × {len(usernames)} usernames = **{len(rows_to_insert)}** total rows."
-                        )
+
+                        if event_mode == "static":
+                            rows_to_insert = []
+                            for acct in accounts:
+                                for uname in usernames:
+                                    rows_to_insert.append((uname, acct["account_id"], acct["url"], schema))
+                            cur.executemany(
+                                f"INSERT INTO {DATABASE}.{schema}.USERNAMES (USERNAME, ACCOUNT_ID, ACCOUNT_URL, EVENT_NAME) VALUES (%s, %s, %s, %s)",
+                                rows_to_insert,
+                            )
+                            st.success(
+                                f"Event **{schema}** created with {len(accounts)} accounts × {len(usernames)} usernames = **{len(rows_to_insert)}** total rows."
+                            )
+                        else:
+                            # Dynamic mode: store account info but no usernames yet
+                            # Insert one placeholder row per account to store account_url mapping
+                            for acct in accounts:
+                                cur.execute(
+                                    f"INSERT INTO {DATABASE}.{schema}.USERNAMES (USERNAME, ACCOUNT_ID, ACCOUNT_URL, EVENT_NAME, PREVIOUSLY_ASSIGNED_TO) VALUES (%s, %s, %s, %s, %s)",
+                                    ("__ACCOUNT_REF__", acct["account_id"], acct["url"], schema, "__SYSTEM__"),
+                                )
+                            st.success(
+                                f"Dynamic event **{schema}** created with {len(accounts)} accounts. Users will be created on demand."
+                            )
                     except Exception as e:
                         st.error(f"Error creating event: {e}")
 
@@ -378,18 +593,34 @@ def render_admin():
             if selected_event:
                 conn = get_conn()
                 cur = conn.cursor()
+
+                # Check event mode
+                try:
+                    cur.execute(f"SELECT EVENT_MODE FROM {DATABASE}.{selected_event}.EVENT_CONFIG LIMIT 1")
+                    mgmt_event_mode = cur.fetchone()
+                    mgmt_event_mode = mgmt_event_mode[0] if mgmt_event_mode else "static"
+                except Exception:
+                    mgmt_event_mode = "static"
+
                 cur.execute(f"""
                     SELECT COUNT(*) AS total, COUNT(CLAIMER_EMAIL) AS claimed
                     FROM {DATABASE}.{selected_event}.USERNAMES
+                    WHERE USERNAME != '__ACCOUNT_REF__'
                 """)
                 total, claimed = cur.fetchone()
-                available = total - claimed
 
-                col1, col2, col3 = st.columns(3)
-                col1.metric("Total", total)
-                col2.metric("Claimed", claimed)
-                col3.metric("Available", available)
-                st.progress(claimed / total if total > 0 else 0)
+                if mgmt_event_mode == "dynamic":
+                    col1, col2 = st.columns(2)
+                    col1.metric("Users Created", total)
+                    col2.metric("Active Claims", claimed)
+                    st.caption("Dynamic event — no upper limit on attendees")
+                else:
+                    available = total - claimed
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("Total", total)
+                    col2.metric("Claimed", claimed)
+                    col3.metric("Available", available)
+                    st.progress(claimed / total if total > 0 else 0)
 
                 st.subheader("Filters")
                 filter_col1, filter_col2 = st.columns(2)
@@ -397,7 +628,7 @@ def render_admin():
                 with filter_col1:
                     selected_accounts = st.multiselect("Accounts", all_accounts, default=all_accounts)
                 with filter_col2:
-                    availability = st.radio("Availability", ["All", "Available", "Claimed"], horizontal=True)
+                    availability = st.radio("Availability", ["All", "Available", "Claimed", "Burned"], horizontal=True)
 
                 df = get_usernames_df(selected_event, selected_accounts, availability)
 
@@ -428,7 +659,7 @@ def render_admin():
                             "Select": st.column_config.CheckboxColumn("Select", default=False),
                             "ACCOUNT_URL": None,
                         },
-                        disabled=["USERNAME", "ACCOUNT_ID", "ACCOUNT_URL", "CLAIMER_EMAIL", "CLAIMED_AT"],
+                        disabled=["USERNAME", "ACCOUNT_ID", "ACCOUNT_URL", "CLAIMER_EMAIL", "CLAIMED_AT", "PREVIOUSLY_ASSIGNED_TO"],
                         key="username_editor",
                     )
 
@@ -513,15 +744,15 @@ def render_admin():
                             if st.button("Confirm Unassign", type="primary", key="confirm_unassign_btn"):
                                 unassigned = 0
                                 try:
-                                    cur = get_conn().cursor()
                                     for _, row in claimed_in_selection.iterrows():
-                                        cur.execute(
-                                            f"""UPDATE {DATABASE}.{selected_event}.USERNAMES
-                                                SET CLAIMER_EMAIL = NULL, CLAIMED_AT = NULL
-                                                WHERE USERNAME = %s AND ACCOUNT_ID = %s""",
-                                            (row["USERNAME"], row["ACCOUNT_ID"]),
-                                        )
-                                        unassigned += cur.rowcount
+                                        if unassign_username(
+                                            selected_event,
+                                            row["USERNAME"],
+                                            row["ACCOUNT_ID"],
+                                            row.get("ACCOUNT_URL", ""),
+                                            row["CLAIMER_EMAIL"],
+                                        ):
+                                            unassigned += 1
                                     st.success(f"Unassigned {unassigned} username(s).")
                                     st.session_state["confirm_unassign"] = False
                                     st.rerun()
@@ -614,18 +845,29 @@ def render_attendee(selected_event: str):
 
     # If viewing a specific claim, show confirmation
     if st.session_state["claimed"]:
+        # Send email on first render after claim (not on page revisits)
+        if st.session_state.get("send_email"):
+            send_claim_email(st.session_state["claimed"])
+            st.session_state["send_email"] = False
+
         render_confirmation(st.session_state["claimed"])
-        if st.button("Back", use_container_width=True):
-            st.session_state["claimed"] = None
-            st.rerun()
     else:
         # Check if any usernames are available
         conn = get_conn()
         cur = conn.cursor()
         cur.execute(
-            f"SELECT COUNT(*) FROM {DATABASE}.{selected_event}.USERNAMES WHERE CLAIMER_EMAIL IS NULL"
+            f"SELECT COUNT(*) FROM {DATABASE}.{selected_event}.USERNAMES WHERE CLAIMER_EMAIL IS NULL AND PREVIOUSLY_ASSIGNED_TO IS NULL AND USERNAME != '__ACCOUNT_REF__'"
         )
         available_count = cur.fetchone()[0]
+
+        # For dynamic events, there are always "available" slots
+        try:
+            cur.execute(f"SELECT EVENT_MODE FROM {DATABASE}.{selected_event}.EVENT_CONFIG LIMIT 1")
+            evt_mode_row = cur.fetchone()
+            if evt_mode_row and evt_mode_row[0] == "dynamic":
+                available_count = 1  # Always available in dynamic mode
+        except Exception:
+            pass
 
         if available_count == 0:
             st.warning("All usernames for this event have been claimed. Please contact your instructor if you need assistance.")
@@ -651,24 +893,10 @@ def render_attendee(selected_event: str):
                             result = claim_username(selected_event, email_clean)
                             if result:
                                 st.session_state["claimed"] = result
+                                st.session_state["send_email"] = True
                                 st.rerun()
                             else:
                                 st.error("All accounts are currently full. Please contact the event organizer.")
-
-    # Claimed accounts list
-    st.divider()
-    st.subheader("Claimed Accounts")
-    st.caption("Click an email to view credentials.")
-
-    claimed_list = get_claimed_usernames(selected_event)
-    if not claimed_list:
-        st.info("No accounts have been claimed yet.")
-    else:
-        for claim in claimed_list:
-            label = f"{claim['email']}  —  {claim['username']} @ {claim['account_id']}"
-            if st.button(label, key=f"lookup_{claim['email']}_{claim['account_id']}_{claim['username']}", use_container_width=True):
-                st.session_state["claimed"] = claim
-                st.rerun()
 
 
 # =============================================================================

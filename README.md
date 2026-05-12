@@ -4,10 +4,25 @@ Streamlit app for distributing Snowflake lab accounts to hands-on event attendee
 
 ## How it works
 
-- **Admin** creates an event with a list of Snowflake accounts and usernames
+- **Admin** creates an event with a list of Snowflake accounts and usernames (or dynamic mode)
 - **Attendees** visit a URL, enter their email, and receive credentials (account URL, username, password)
-- Usernames are assigned sequentially (one account fills before the next)
+- Usernames are assigned based on the configured distribution mode
 - Same email re-submitted returns the existing assignment (idempotent)
+
+## Event Modes
+
+| Mode | Description |
+|------|-------------|
+| **Static** | Admin provides a list of usernames upfront. All rows are pre-populated. |
+| **Dynamic** | Usernames (USER1, USER2, ...) are generated on-the-fly when attendees claim. A Snowflake USER is created on the target account via the ADMIN user at claim time. |
+
+## Distribution Modes
+
+| Mode | Description |
+|------|-------------|
+| **sequential** | Fill one account completely before moving to the next |
+| **round_robin** | Spread claims evenly across accounts |
+| **random** | Assign a random available username from any account |
 
 ## URLs
 
@@ -74,6 +89,15 @@ warehouse = "COMPUTE_WH"
 
 [admin]
 password = "your-admin-password"
+
+[accounts]
+admin_password = "sn0wf@ll"
+
+[ses]
+aws_access_key_id = "..."
+aws_secret_access_key = "..."
+region = "us-west-2"
+sender = "sender@example.com"
 ```
 
 ## Project Structure

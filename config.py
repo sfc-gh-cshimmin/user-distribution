@@ -107,3 +107,33 @@ def get_connection() -> snowflake.connector.SnowflakeConnection:
         database=DATABASE,
         client_session_keep_alive=True,
     )
+
+
+def get_account_admin_password() -> str:
+    """Get the ADMIN password for target accounts from secrets or default."""
+    try:
+        import streamlit as st
+        if hasattr(st, "secrets") and "accounts" in st.secrets:
+            return st.secrets["accounts"]["admin_password"]
+    except Exception:
+        pass
+    return DEFAULT_PASSWORD
+
+
+def get_account_connection(account_url: str) -> snowflake.connector.SnowflakeConnection:
+    """
+    Connect to a target account as ADMIN to run user DDL.
+    account_url is the full URL like https://sfsehol-abc123.snowflakecomputing.com
+    """
+    # Extract account locator from URL
+    # e.g., https://sfsehol-abc123.snowflakecomputing.com -> sfsehol-abc123
+    host = account_url.replace("https://", "").replace("http://", "").rstrip("/")
+    account = host.replace(".snowflakecomputing.com", "")
+
+    return snowflake.connector.connect(
+        account=account,
+        user="ADMIN",
+        password=get_account_admin_password(),
+        role="ACCOUNTADMIN",
+        warehouse="COMPUTE_WH",
+    )
