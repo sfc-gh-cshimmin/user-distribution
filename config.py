@@ -57,15 +57,26 @@ def get_connection() -> snowflake.connector.SnowflakeConnection:
     # Streamlit Cloud mode: secrets configured in dashboard
     secrets = _get_streamlit_secrets()
     if secrets:
-        return snowflake.connector.connect(
+        connect_kwargs = dict(
             account=secrets["account"],
             user=secrets["user"],
-            password=secrets["password"],
             role=secrets.get("role", "ACCOUNTADMIN"),
             warehouse=secrets.get("warehouse", "COMPUTE_WH"),
             database=DATABASE,
             client_session_keep_alive=True,
         )
+
+        # Prefer key-pair auth if private_key is provided in secrets
+        if "private_key" in secrets:
+            from cryptography.hazmat.primitives import serialization
+            private_key = serialization.load_pem_private_key(
+                secrets["private_key"].encode(), password=None
+            )
+            connect_kwargs["private_key"] = private_key
+        else:
+            connect_kwargs["password"] = secrets.get("password", "")
+
+        return snowflake.connector.connect(**connect_kwargs)
 
     # SPCS mode: token file exists at /snowflake/session/token
     if os.path.isfile(SPCS_TOKEN_PATH):
