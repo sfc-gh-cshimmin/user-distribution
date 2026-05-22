@@ -392,7 +392,7 @@ def unassign_username(schema: str, username: str, account_id: str, account_url: 
     return cur.rowcount > 0
 
 
-def render_confirmation(claim):
+def render_confirmation(claim, instructions_url: str = None):
     st.success("Here are your credentials:")
     st.markdown("---")
     col1, col2 = st.columns(2)
@@ -410,6 +410,8 @@ def render_confirmation(claim):
         st.markdown("**Email**")
         st.code(claim["email"])
     st.markdown("---")
+    if instructions_url:
+        st.link_button("Lab Instructions", instructions_url, use_container_width=True)
     st.info("Save these credentials. You'll need them to log in to the lab environment.")
 
 
@@ -826,6 +828,37 @@ def render_admin():
                             st.error(f"Error: {e}")
 
                 st.divider()
+                st.subheader("Instructions URL")
+
+                # Fetch current instructions URL
+                try:
+                    cur = get_conn().cursor()
+                    cur.execute(f"SELECT INSTRUCTIONS_URL FROM {DATABASE}.{evt}.EVENT_CONFIG LIMIT 1")
+                    iurl_row = cur.fetchone()
+                    current_iurl = iurl_row[0] if iurl_row and iurl_row[0] else ""
+                except Exception:
+                    current_iurl = ""
+
+                new_iurl = st.text_input(
+                    "Instructions URL",
+                    value=current_iurl,
+                    placeholder="https://docs.google.com/...",
+                    key="instructions_url_input",
+                    help="Link included in the credentials email sent to attendees",
+                )
+
+                if st.button("Update Instructions URL", key="update_iurl_btn"):
+                    try:
+                        cur = get_conn().cursor()
+                        cur.execute(
+                            f"UPDATE {DATABASE}.{evt}.EVENT_CONFIG SET INSTRUCTIONS_URL = %s",
+                            (new_iurl.strip() or None,),
+                        )
+                        st.success("Instructions URL updated.")
+                    except Exception as e:
+                        st.error(f"Error: {e}")
+
+                st.divider()
                 st.subheader("Delete Event")
                 st.warning(f"This will permanently delete all data for event **{evt}**.")
 
@@ -859,21 +892,22 @@ def render_attendee(selected_event: str):
 
     # If viewing a specific claim, show confirmation
     if st.session_state["claimed"]:
+        # Fetch instructions URL from event config
+        try:
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute(f"SELECT INSTRUCTIONS_URL FROM {DATABASE}.{selected_event}.EVENT_CONFIG LIMIT 1")
+            iurl_row = cur.fetchone()
+            event_instructions_url = iurl_row[0] if iurl_row and iurl_row[0] else None
+        except Exception:
+            event_instructions_url = None
+
         # Send email on first render after claim (not on page revisits)
         if st.session_state.get("send_email"):
-            # Fetch instructions URL from event config
-            try:
-                conn = get_conn()
-                cur = conn.cursor()
-                cur.execute(f"SELECT INSTRUCTIONS_URL FROM {DATABASE}.{selected_event}.EVENT_CONFIG LIMIT 1")
-                iurl_row = cur.fetchone()
-                event_instructions_url = iurl_row[0] if iurl_row and iurl_row[0] else None
-            except Exception:
-                event_instructions_url = None
             send_claim_email(st.session_state["claimed"], instructions_url=event_instructions_url)
             st.session_state["send_email"] = False
 
-        render_confirmation(st.session_state["claimed"])
+        render_confirmation(st.session_state["claimed"], instructions_url=event_instructions_url)
     else:
         # Check if any usernames are available
         conn = get_conn()
