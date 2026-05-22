@@ -229,16 +229,18 @@ def claim_username(schema: str, email: str):
 
     # Get event config
     try:
-        cur.execute(f"SELECT DISTRIBUTION_MODE, EVENT_MODE FROM {DATABASE}.{schema}.EVENT_CONFIG LIMIT 1")
+        cur.execute(f"SELECT DISTRIBUTION_MODE, EVENT_MODE, DEFAULT_ROLE FROM {DATABASE}.{schema}.EVENT_CONFIG LIMIT 1")
         row = cur.fetchone()
         mode = row[0] if row and row[0] else "sequential"
         event_mode = row[1] if row and row[1] else "static"
+        default_role = row[2] if row and len(row) > 2 and row[2] else "PUBLIC"
     except Exception:
         mode = "sequential"
         event_mode = "static"
+        default_role = "PUBLIC"
 
     if event_mode == "dynamic":
-        return _claim_dynamic(schema, email, mode, conn)
+        return _claim_dynamic(schema, email, mode, conn, default_role)
     else:
         return _claim_static(schema, email, mode, conn)
 
@@ -282,7 +284,7 @@ def _claim_static(schema: str, email: str, mode: str, conn):
     return None
 
 
-def _claim_dynamic(schema: str, email: str, mode: str, conn):
+def _claim_dynamic(schema: str, email: str, mode: str, conn, default_role: str = "PUBLIC"):
     """Generate a new USER on-the-fly and claim it."""
     cur = conn.cursor()
 
@@ -337,10 +339,10 @@ def _claim_dynamic(schema: str, email: str, mode: str, conn):
         acct_cur.execute(f"""
             CREATE USER IF NOT EXISTS {new_username}
             PASSWORD = '{DEFAULT_PASSWORD}'
-            DEFAULT_ROLE = PUBLIC
+            DEFAULT_ROLE = {default_role}
             MUST_CHANGE_PASSWORD = FALSE
         """)
-        acct_cur.execute(f"GRANT ROLE PUBLIC TO USER {new_username}")
+        acct_cur.execute(f"GRANT ROLE {default_role} TO USER {new_username}")
         acct_cur.execute(f"ALTER USER {new_username} SET MINS_TO_BYPASS_MFA = 30")
         acct_conn.close()
     except Exception as e:
@@ -498,6 +500,12 @@ def render_admin():
             ],
         )
 
+        default_role = st.text_input(
+            "Default Role (optional)",
+            value="PUBLIC",
+            help="Role granted to and set as default for created users (dynamic mode). Also used for static mode if users are pre-created.",
+        )
+
         instructions_url = st.text_input(
             "Instructions URL (optional)",
             placeholder="https://docs.google.com/...",
@@ -562,13 +570,14 @@ def render_admin():
                                 PASSWORD            VARCHAR,
                                 DISTRIBUTION_MODE   VARCHAR DEFAULT 'sequential',
                                 EVENT_MODE          VARCHAR DEFAULT 'static',
+                                DEFAULT_ROLE        VARCHAR DEFAULT 'PUBLIC',
                                 INSTRUCTIONS_URL    VARCHAR,
                                 CREATED_AT          TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
                             )
                         """)
                         cur.execute(
-                            f"INSERT INTO {DATABASE}.{schema}.EVENT_CONFIG (EVENT_NAME, PASSWORD, DISTRIBUTION_MODE, EVENT_MODE, INSTRUCTIONS_URL) VALUES (%s, %s, %s, %s, %s)",
-                            (schema, DEFAULT_PASSWORD, distribution_mode, event_mode, instructions_url.strip() or None),
+                            f"INSERT INTO {DATABASE}.{schema}.EVENT_CONFIG (EVENT_NAME, PASSWORD, DISTRIBUTION_MODE, EVENT_MODE, DEFAULT_ROLE, INSTRUCTIONS_URL) VALUES (%s, %s, %s, %s, %s, %s)",
+                            (schema, DEFAULT_PASSWORD, distribution_mode, event_mode, default_role.strip() or "PUBLIC", instructions_url.strip() or None),
                         )
 
                         if event_mode == "static":
@@ -826,6 +835,36 @@ def render_admin():
                             st.success(f"Display name updated to **{new_sanitized}**. URL slug remains `?event={evt}`")
                         except Exception as e:
                             st.error(f"Error: {e}")
+
+                st.divider()
+                st.subheader("Default Role")
+
+                # Fetch current default role
+                try:
+                    cur = get_conn().cursor()
+                    cur.execute(f"SELECT DEFAULT_ROLE FROM {DATABASE}.{evt}.EVENT_CONFIG LIMIT 1")
+                    role_row = cur.fetchone()
+                    current_role = role_row[0] if role_row and role_row[0] else "PUBLIC"
+                except Exception:
+                    current_role = "PUBLIC"
+
+                new_role = st.text_input(
+                    "Default Role",
+                    value=current_role,
+                    key="default_role_input",
+                    help="Role granted to users created in dynamic mode",
+                )
+
+                if st.button("Update Default Role", key="update_role_btn"):
+                    try:
+                        cur = get_conn().cursor()
+                        cur.execute(
+                            f"UPDATE {DATABASE}.{evt}.EVENT_CONFIG SET DEFAULT_ROLE = %s",
+                            (new_role.strip() or "PUBLIC",),
+                        )
+                        st.success("Default role updated.")
+                    except Exception as e:
+                        st.error(f"Error: {e}")
 
                 st.divider()
                 st.subheader("Instructions URL")
