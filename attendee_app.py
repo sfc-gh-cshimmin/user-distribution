@@ -16,7 +16,7 @@ from config import get_connection, get_account_connection, DATABASE, DEFAULT_PAS
 # =============================================================================
 
 
-def send_claim_email(claim: dict):
+def send_claim_email(claim: dict, instructions_url: str = None):
     """Send credentials email via AWS SES. Shows toast on success/failure."""
     try:
         if "ses" not in st.secrets:
@@ -36,6 +36,12 @@ def send_claim_email(claim: dict):
         sender = ses_config["sender"]
         account_link = claim.get("account_url", claim["account_id"])
 
+        instructions_html = ""
+        instructions_text = ""
+        if instructions_url:
+            instructions_html = f'<p style="margin-top:16px;"><strong>Instructions:</strong> <a href="{instructions_url}">{instructions_url}</a></p>'
+            instructions_text = f"\nInstructions: {instructions_url}"
+
         body_html = f"""
         <h2>Your Lab Credentials</h2>
         <table style="border-collapse:collapse; font-size:16px;">
@@ -43,6 +49,7 @@ def send_claim_email(claim: dict):
             <tr><td style="padding:8px; font-weight:bold;">Username</td><td style="padding:8px;"><code>{claim['username']}</code></td></tr>
             <tr><td style="padding:8px; font-weight:bold;">Password</td><td style="padding:8px;"><code>{DEFAULT_PASSWORD}</code></td></tr>
         </table>
+        {instructions_html}
         <p style="margin-top:16px; color:#666;">Save these credentials. You'll need them to log in to the lab environment.</p>
         """
 
@@ -50,7 +57,7 @@ def send_claim_email(claim: dict):
 Account: {account_link}
 Username: {claim['username']}
 Password: {DEFAULT_PASSWORD}
-
+{instructions_text}
 Save these credentials. You'll need them to log in to the lab environment."""
 
         client.send_email(
@@ -489,6 +496,12 @@ def render_admin():
             ],
         )
 
+        instructions_url = st.text_input(
+            "Instructions URL (optional)",
+            placeholder="https://docs.google.com/...",
+            help="If provided, this link will be included in the credentials email sent to attendees",
+        )
+
         # Overview panel
         st.divider()
         st.subheader("Event Summary")
@@ -547,12 +560,13 @@ def render_admin():
                                 PASSWORD            VARCHAR,
                                 DISTRIBUTION_MODE   VARCHAR DEFAULT 'sequential',
                                 EVENT_MODE          VARCHAR DEFAULT 'static',
+                                INSTRUCTIONS_URL    VARCHAR,
                                 CREATED_AT          TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
                             )
                         """)
                         cur.execute(
-                            f"INSERT INTO {DATABASE}.{schema}.EVENT_CONFIG (EVENT_NAME, PASSWORD, DISTRIBUTION_MODE, EVENT_MODE) VALUES (%s, %s, %s, %s)",
-                            (schema, DEFAULT_PASSWORD, distribution_mode, event_mode),
+                            f"INSERT INTO {DATABASE}.{schema}.EVENT_CONFIG (EVENT_NAME, PASSWORD, DISTRIBUTION_MODE, EVENT_MODE, INSTRUCTIONS_URL) VALUES (%s, %s, %s, %s, %s)",
+                            (schema, DEFAULT_PASSWORD, distribution_mode, event_mode, instructions_url.strip() or None),
                         )
 
                         if event_mode == "static":
@@ -847,7 +861,16 @@ def render_attendee(selected_event: str):
     if st.session_state["claimed"]:
         # Send email on first render after claim (not on page revisits)
         if st.session_state.get("send_email"):
-            send_claim_email(st.session_state["claimed"])
+            # Fetch instructions URL from event config
+            try:
+                conn = get_conn()
+                cur = conn.cursor()
+                cur.execute(f"SELECT INSTRUCTIONS_URL FROM {DATABASE}.{selected_event}.EVENT_CONFIG LIMIT 1")
+                iurl_row = cur.fetchone()
+                event_instructions_url = iurl_row[0] if iurl_row and iurl_row[0] else None
+            except Exception:
+                event_instructions_url = None
+            send_claim_email(st.session_state["claimed"], instructions_url=event_instructions_url)
             st.session_state["send_email"] = False
 
         render_confirmation(st.session_state["claimed"])
