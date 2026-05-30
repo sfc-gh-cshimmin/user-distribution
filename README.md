@@ -97,7 +97,7 @@ admin_password = "sn0wf@ll"
 aws_access_key_id = "..."
 aws_secret_access_key = "..."
 region = "us-west-2"
-sender = "sender@example.com"
+sender = "developers@snowflake.com"
 ```
 
 ## Project Structure

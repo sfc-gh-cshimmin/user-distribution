@@ -994,6 +994,15 @@ def render_attendee(selected_event: str):
                             else:
                                 st.error("All accounts are currently full. Please contact the event organizer.")
 
+            # Show lab instructions link if configured for this event
+            try:
+                cur.execute(f"SELECT INSTRUCTIONS_URL FROM {DATABASE}.{selected_event}.EVENT_CONFIG LIMIT 1")
+                instructions_row = cur.fetchone()
+                if instructions_row and instructions_row[0]:
+                    st.link_button(":material/menu_book: Lab Instructions", instructions_row[0], use_container_width=True)
+            except Exception:
+                pass
+
 
 # =============================================================================
 # Router
