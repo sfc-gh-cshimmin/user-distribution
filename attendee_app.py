@@ -39,7 +39,12 @@ def send_claim_email(claim: dict, instructions_url: str = None):
         instructions_html = ""
         instructions_text = ""
         if instructions_url:
-            instructions_html = f'<p style="margin-top:16px;"><strong>Instructions:</strong> <a href="{instructions_url}">{instructions_url}</a></p>'
+            instructions_html = (
+                f'<p style="margin-top:24px;">'
+                f'<a href="{instructions_url}" style="display:inline-block; padding:12px 24px; '
+                f'background-color:#29B5E8; color:#ffffff; text-decoration:none; font-weight:bold; '
+                f'font-size:16px; border-radius:6px;">View Lab Instructions &rarr;</a></p>'
+            )
             instructions_text = f"\nInstructions: {instructions_url}"
 
         body_html = f"""
