@@ -133,7 +133,7 @@ def get_account_admin_password() -> str:
 
 def get_account_connection(account_url: str) -> snowflake.connector.SnowflakeConnection:
     """
-    Connect to a target account as ADMIN to run user DDL.
+    Connect to a target account as USER to run user DDL.
     account_url is the full URL like https://sfsehol-abc123.snowflakecomputing.com
     """
     # Extract account locator from URL
@@ -143,7 +143,7 @@ def get_account_connection(account_url: str) -> snowflake.connector.SnowflakeCon
 
     return snowflake.connector.connect(
         account=account,
-        user="ADMIN",
+        user="USER",
         password=get_account_admin_password(),
         role="ACCOUNTADMIN",
         warehouse="COMPUTE_WH",
